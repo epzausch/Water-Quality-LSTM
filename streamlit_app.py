@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score
 import requests
 from io import StringIO
+import torch
 import numpy as np
 import pandas as pd
 # from sklearn.preprocessing import StandardScaler
@@ -115,10 +116,16 @@ def fetch_usgs_for_param_range(pcode: tuple, start_dt: pd.Timestamp, end_dt: pd.
         df.set_index('DateTime', inplace=True)
         if pcode[0] in df.columns:
             series = df[pcode[0]].rename(pcode[0])
-            # drop duplicates and NaNs
+
+            # Convert USGS missing markers like '--' or '-' to NaN
+            series = pd.to_numeric(series, errors='coerce')
+
+            # Drop duplicates and NaNs
             series = series[~series.index.duplicated(keep='first')]
             series = series.dropna()
+
             parts.append(series)
+
 
     if not parts:
         return pd.Series(dtype=float)
@@ -128,7 +135,63 @@ def fetch_usgs_for_param_range(pcode: tuple, start_dt: pd.Timestamp, end_dt: pd.
     combined = combined.loc[start_dt:end_dt]
     # Reindex to hourly and forward/backfill small gaps, then keep numeric values
     full_idx = pd.date_range(start_dt, end_dt, freq='h')
+    
     combined = combined.reindex(full_idx).astype(float)
+    combined = combined.interpolate(method='time').ffill().bfill()
+    combined.index.name = 'DateTime'
+    return combined
+
+
+@st.cache_data(show_spinner=False)
+def fetch_params_for_year(year: int) -> pd.DataFrame:
+    """Fetch all parameters for a full calendar year and return a DataFrame indexed hourly with short column names."""
+    year_start = pd.Timestamp(year=year, month=1, day=1, hour=0)
+    year_end = pd.Timestamp(year=year, month=12, day=31, hour=23)
+    parts = []
+    col_names = []
+    for long_name, code in parameter_key:
+        short = column_map.get(long_name)
+        if short is None:
+            continue
+        series = fetch_usgs_for_param_range((long_name, code), year_start, year_end)
+        if series.empty:
+            # create empty series for consistency
+            series = pd.Series(index=pd.date_range(year_start, year_end, freq='h'), dtype=float)
+        series.name = short
+        parts.append(series)
+        col_names.append(short)
+    if not parts:
+        return pd.DataFrame()
+    df_year = pd.concat(parts, axis=1)
+    df_year.index.name = 'DateTime'
+    # Ensure hourly index for the whole year
+    full_idx = pd.date_range(year_start, year_end, freq='h')
+    df_year = df_year.reindex(full_idx)
+    # Interpolate small gaps and fill remaining with zeros
+    df_year = df_year.interpolate(method='time').ffill().bfill()
+    # Add rainfall placeholder column
+    if 'Precipitation 1hr (in)' not in df_year.columns:
+        df_year['Precipitation 1hr (in)'] = 0.0
+    return df_year
+
+
+@st.cache_data(show_spinner=False)
+def fetch_params_for_range(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
+    """Fetch parameters for the requested datetime range by composing cached per-year data."""
+    years = list(range(start_dt.year, end_dt.year + 1))
+    parts = []
+    for y in years:
+        dfy = fetch_params_for_year(y)
+        if dfy.empty:
+            continue
+        parts.append(dfy)
+    if not parts:
+        return pd.DataFrame()
+    combined = pd.concat(parts).sort_index()
+    combined = combined.loc[start_dt:end_dt]
+    # Ensure hourly index
+    full_idx = pd.date_range(start_dt, end_dt, freq='h')
+    combined = combined.reindex(full_idx)
     combined = combined.interpolate(method='time').ffill().bfill()
     combined.index.name = 'DateTime'
     return combined
@@ -167,6 +230,7 @@ class SlidingWindowDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.X[idx], self.Y[idx]
+    
 class LSTMForecaster(nn.Module):
     def __init__(self, n_features, hidden_size=128, num_layers=2, out_len=24, dropout=0.2):
         super().__init__()
@@ -269,7 +333,7 @@ def main():
         st.error("Loaded `super_data.pkl` contains no parameters.")
         st.stop()
 
-    param = st.selectbox("Choose parameter to inspect", params)
+    param = st.selectbox("Choose parameter to inspect", [params[1]]+[params[0]]+params[2:])
     res = super_data.get(param)
     if res is None:
         st.error("Selected parameter has no result object.")
@@ -290,64 +354,129 @@ def main():
         st.stop()
 
     # Default date to first available test index
-    default_date = pd.to_datetime(test_index[0]).date()
+    try:
+        # Make july 20th 2024 the default date
+        default_date = pd.to_datetime("2024-07-20").date()
+    except:
+        default_date = pd.to_datetime(test_index[10]).date()
     today_date = pd.Timestamp.now().date()
     chosen_date = st.date_input("Choose forecast date", value=default_date, max_value=today_date)
-    allow_nearest = st.checkbox("If exact date not present, use nearest available forecast date", value=True)
+    allow_nearest = st.checkbox("If exact date not present, use nearest available forecast date (Turn off to fetch new data)", value=True)
 
     dt = pd.Timestamp(chosen_date)
     idx = find_best_index(res['test_index'], dt, allow_nearest=allow_nearest)
 
     if idx is None:
-        st.info("Selected date not found in stored forecasts — fetching observation data (1 week prior) from USGS.")
+        st.info("Selected date not found in stored forecasts — fetching observation data and running model (if available).")
 
-        # Build mapping from short column name to pcode tuple
-        short_to_pcode = {}
-        for long_name, code in parameter_key:
-            short = column_map.get(long_name)
-            if short:
-                short_to_pcode[short] = (long_name, code)
+        # Determine input length (assume 168 by default but allow override)
+        input_len = 168# st.number_input("Input sequence length (hours)", min_value=24, max_value=168*4, value=168)
 
-        pcode = short_to_pcode.get(param)
-        if pcode is None:
-            st.warning("Unable to find USGS parameter code for selected parameter; cannot fetch observations.")
-            st.stop()
+        # Determine fetch range: we need input window (input_len hours before dt) and 24h after dt for truth
+        start_input = dt - pd.Timedelta(hours=input_len)
+        end_output = dt + pd.Timedelta(hours=23)
 
-        # Define requested range: 7 days before chosen date up through the forecast day (24h)
-        start_dt = dt - pd.Timedelta(days=7)
-        end_dt = dt + pd.Timedelta(hours=23)
-
+        # Fetch all parameters for the required range using cached per-year fetch
         try:
-            series = fetch_usgs_for_param_range(pcode, start_dt, end_dt)
+            df_feats = fetch_params_for_range(start_input, end_output)
         except Exception as e:
             st.error(f"Failed to fetch observations from USGS: {e}")
             st.stop()
 
-        if series.empty:
+        if df_feats.empty:
             st.warning("No observations returned from USGS for the requested range.")
             st.stop()
 
-        # Build a temporary full_df containing the parameter and a placeholder rainfall column set to 0
-        full_df_temp = pd.DataFrame({param: series})
-        full_df_temp['Precipitation 1hr (in)'] = 0.0
+        # Map column names to those expected by the model (res['input_cols'])
+        input_cols = res.get('input_cols', list(df_feats.columns))
+        # Ensure all required columns exist in df_feats; if missing, create with zeros
+        for c in input_cols:
+            if c not in df_feats.columns:
+                df_feats[c] = 0.0
 
-        st.write("No model prediction available for that exact date. Showing observed history pulled from USGS:")
-        # Plot week history + any available 24h after dt
-        def plot_history_only(df_hist: pd.DataFrame, param_name: str, day_start: pd.Timestamp):
-            fig, ax = plt.subplots(figsize=(10,5))
-            week_start = day_start - pd.Timedelta(days=7)
-            hist = df_hist[param_name].loc[week_start:day_start + pd.Timedelta(hours=23)]
-            ax.plot(hist.index, hist.values, label='Observed (week + forecast day)', color='tab:blue')
-            ax.axvline(day_start, color='k', linestyle=':', label='Forecast start')
-            ax.set_title(f"Observed: Week before + 24h for {param_name} starting {day_start.date()}")
-            ax.set_xlabel('Datetime')
-            ax.set_ylabel(param_name)
-            ax.legend()
-            ax.grid(alpha=0.3)
-            fig.autofmt_xdate()
-            st.pyplot(fig)
+        # Create input window (input_len hours ending at dt-1h)
+        input_start = dt - pd.Timedelta(hours=input_len)
+        input_end = dt - pd.Timedelta(hours=1)
+        X_window = df_feats.loc[input_start:input_end, input_cols]
+        # If we don't have enough rows, reindex and fill
+        if X_window.shape[0] != input_len:
+            idx_full = pd.date_range(input_start, input_end, freq='h')
+            X_window = X_window.reindex(idx_full)
+            X_window = X_window.interpolate(method='time').ffill().bfill()
 
-        plot_history_only(full_df_temp, param, dt)
+        # Scale using saved X_scaler
+        X_scaler = res.get('X_scaler')
+        if X_scaler is None:
+            st.error("No X_scaler found in model result; cannot prepare features for model.")
+            st.stop()
+
+        X_scaled = X_scaler.transform(X_window.values)
+        # reshape to (1, seq_len, n_features)
+        X_input = X_scaled.reshape(1, X_scaled.shape[0], X_scaled.shape[1]).astype(np.float32)
+
+        # Run model prediction (move model to CPU)
+        model = res.get('model')
+        if model is None:
+            st.error("No model object found in the selected parameter result.")
+            st.stop()
+
+        try:
+            model.to('cpu')
+            model.eval()
+            with torch.no_grad():
+                tx = torch.from_numpy(X_input)
+                preds_scaled = model(tx).cpu().numpy()[0]  # shape (out_len,)
+        except Exception as e:
+            st.error(f"Failed to run model prediction: {e}")
+            st.stop()
+
+        # Inverse transform predictions using y_scaler
+        y_scaler = res.get('y_scaler')
+        if y_scaler is None:
+            st.error("No y_scaler found in model result; cannot inverse-transform predictions.")
+            st.stop()
+
+        preds_inv = y_scaler.inverse_transform(preds_scaled.reshape(-1, 1)).reshape(-1)
+
+        # Build times for prediction
+        pred_times = pd.date_range(dt, periods=preds_inv.shape[0], freq='h')
+
+        # Plot week history and the prediction vs any observed truth
+        fig, ax = plt.subplots(figsize=(10, 5))
+        week_start = dt - pd.Timedelta(days=7)
+        if res.get('target_col') in df_feats.columns:
+            hist = df_feats[res['target_col']].loc[week_start:dt - pd.Timedelta(hours=1)]
+            if len(hist) > 0:
+                ax.plot(hist.index, hist.values, label='Previous 7 days (actual)', color='tab:blue')
+
+        # Plot predicted 24h
+        ax.plot(pred_times, preds_inv, label='Prediction (24h)', color='tab:red')
+
+        # Plot observed truth if available
+        target_col = res.get('target_col')
+        observed = None
+        if target_col in df_feats.columns:
+            observed = df_feats[target_col].loc[dt:dt + pd.Timedelta(hours=23)]
+            if observed.isna().all():
+                observed = None
+        if observed is not None and len(observed) > 0:
+            ax.plot(observed.index, observed.values, label='Observed (24h)', color='tab:green', linestyle='--')
+            # compute r2 if lengths align
+            if len(observed.dropna()) >= 2 and len(observed.dropna()) == len(preds_inv):
+                try:
+                    r2 = r2_score(observed.values, preds_inv[: len(observed)])
+                    st.write(f"R² for prediction vs observed (available hours): {r2:.3f}")
+                except Exception:
+                    pass
+
+        ax.axvline(dt, color='k', linestyle=':', label='Forecast start')
+        ax.set_title(f"Model prediction for {param} starting {dt.date()}")
+        ax.set_xlabel('Datetime')
+        ax.set_ylabel(param)
+        ax.legend()
+        ax.grid(alpha=0.3)
+        fig.autofmt_xdate()
+        st.pyplot(fig)
 
     else:
         # Show chosen / actual date info
