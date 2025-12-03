@@ -317,10 +317,16 @@ def plot_prediction_vs_actual(res: dict, idx: int):
 
 def main():
     st.title("Swift Creek — Forecast Viewer")
+    st.subheader("LSTM model developed for NC State CE 591 Final Project")
     st.markdown(
-        "Upload `super_data.pkl` in the same directory as this app (or it will attempt to load one from the working directory)."
+        "This web app allows users to visualize and analyze water quality forecasts. The model was trained on historical USGS data (2020-2023) for Spring Creek, Texas."
     )
-
+    url = "https://nrtwq.usgs.gov/explore/datatable?site_no=08068500&pcode=00060&period=2024_all&timestep=uv&is_verbose=y"
+    st.markdown(
+        "This app can even fetch new observation data from USGS [NRTWQ Site](%s) and run the model to generate forecasts for dates not present in the stored results. (2025-present)" % url
+    )
+    st.markdown("As of December 2025 data from October 20th 2025 onward is missing. ")
+    
     # Load data
     try:
         super_data = load_super_data("super_data.pkl")
