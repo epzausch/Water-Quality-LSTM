@@ -35,15 +35,29 @@ def temporal_splits(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     # Ensure datetime index
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("DataFrame must have a DatetimeIndex (hourly).")
-    # Interpolate missing hours (optional): reindex to full hourly range between min/max
-    full_idx = pd.date_range(df.index.min(), df.index.max(), freq="h")
-    df = df.reindex(full_idx)
-    # Simple missing-value handling -- fill/interpolate (you can swap strategies)
-    df = df.interpolate(method='time').ffill().bfill()
-    
-    train = df.loc['2020-01-01':'2023-12-31 23:00:00']
-    val   = df.loc['2024-01-01':'2024-06-30 23:00:00']
-    test  = df.loc['2024-07-01':'2024-12-31 23:00:00']
+    # IMPORTANT: do NOT interpolate/fill the entire DataFrame before splitting.
+    # That would allow future (validation/test) values to leak into training via interpolation/backfill.
+    # Instead, prepare each split independently and apply reindex/interpolate only within that split's window.
+    # Prepare train first using causal imputation (only past information)
+    train_idx = pd.date_range('2020-01-01', '2023-12-31 23:00:00', freq="h")
+    train = df.loc['2020-01-01':'2023-12-31 23:00:00'].reindex(train_idx)
+    # Use forward-fill to impute from past values only (causal). This avoids using future points to fill earlier holes.
+    train = train.ffill()
+    # For any remaining NaNs at the start of the training period, fill with column-wise means computed on the (ffill) train data.
+    train_means = train.mean()
+    train = train.fillna(train_means)
+
+    def _prepare_split_using_train_means(start: str, end: str) -> pd.DataFrame:
+        idx = pd.date_range(start, end, freq="h")
+        sub = df.loc[start:end].reindex(idx)
+        # forward-fill within the split (only uses past)
+        sub = sub.ffill()
+        # fill any remaining NaNs (e.g., at the very beginning) with the training split means -> no future leakage
+        sub = sub.fillna(train_means)
+        return sub
+
+    val   = _prepare_split_using_train_means('2024-01-01', '2024-06-30 23:00:00')
+    test  = _prepare_split_using_train_means('2024-07-01', '2024-12-31 23:00:00')
     return {"train": train, "val": val, "test": test}
 
 
