@@ -1,0 +1,9 @@
+To make this more publisheable
+- Compare against a baseline(s), Day after, XGBoost, Transformers. Maybe rather than ours vs theirs we just show mutliple models. Make an ensemble model?
+- Add more variables (air temp?)
+- Pull out information about the sensor. I.e. near a power plant or something similar
+- Remove extreme weather events? Or at least classify them. Is camp mystic flash flood in event
+- Add uncertainty. Make it predict a confidence interval rather than a value
+- Feature importance analysis ***
+- Include more sensor locations? Downstream vs Upstream? 
+- Plot a GIS of spring creek
