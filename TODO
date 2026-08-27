@@ -7,3 +7,6 @@ To make this more publisheable
 - Feature importance analysis ***
 - Include more sensor locations? Downstream vs Upstream? 
 - Plot a GIS of spring creek
+
+Bugs
+- Why does USGS data not start on first row
